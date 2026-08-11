@@ -124,8 +124,13 @@ _VEO_LOCAL_IMAGE_CACHE_DIR = STATIC_DIR / "assets" / _VEO_LOCAL_IMAGE_CACHE_SUBD
 _VEO_LOCAL_IMAGE_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(
     _veo_int_env("VEO_LOCAL_IMAGE_DOWNLOAD_CONCURRENCY", 100, min_value=1, max_value=64)
 )
-_VEO_LOCAL_IMAGE_LOCKS: Dict[str, asyncio.Lock] = {}
-_VEO_LOCAL_IMAGE_LOCKS_GUARD = asyncio.Lock()
+_VEO_LOCAL_IMAGE_LOCK_STRIPE_COUNT = _veo_int_env(
+    "VEO_LOCAL_IMAGE_LOCK_STRIPES",
+    256,
+    min_value=64,
+    max_value=4096,
+)
+_VEO_LOCAL_IMAGE_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(_VEO_LOCAL_IMAGE_LOCK_STRIPE_COUNT))
 _VEO_LOCAL_IMAGE_LAST_CLEANUP = 0.0
 _VEO_OMNI_T2V_MODEL="abra_t2v_10s"
 _VEO_OMNI_R2V_MODEL="abra_r2v_10s"
@@ -253,9 +258,11 @@ def _veo_extension_local_image_cache_enabled(payload: Dict[str, Any]) -> bool:
     直连下载到 `/assets/veo_image_cache/`，插件再从配置的 base_url 读取本机白名单
     地址，避免图片下载走指纹浏览器代理。
     """
+    payload = payload or {}
+    if bool(payload.get("public_api_safe_raster_only")):
+        return True
     if not _veo_env_enabled("VEO_LOCAL_IMAGE_CACHE_ENABLED", True):
         return False
-    payload = payload or {}
     for key in (
         "localize_extension_images",
         "veo_localize_extension_images",
@@ -339,6 +346,17 @@ def _veo_local_asset_path_from_url(raw: str) -> Optional[Path]:
         if base not in p.parents and p != base:
             return None
         return p if p.exists() else None
+    except Exception:
+        return None
+
+
+def _veo_trusted_local_asset_path(raw: str) -> Optional[Path]:
+    try:
+        parsed = urlparse(str(raw or "").strip())
+        base = urlparse(_veo_extension_http_base_url())
+        if parsed.scheme.lower() != base.scheme.lower() or parsed.netloc.lower() != base.netloc.lower():
+            return None
+        return _veo_local_asset_path_from_url(raw)
     except Exception:
         return None
 
@@ -503,11 +521,37 @@ def _veo_sniff_image_mime(data: bytes) -> str:
     return ""
 
 
-def _veo_validate_image_bytes(head: bytes, *, content_type: str, source_label: str) -> str:
+_VEO_SAFE_RASTER_IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+    "image/avif",
+}
+
+
+def _veo_validate_image_bytes(
+    head: bytes,
+    *,
+    content_type: str,
+    source_label: str,
+    require_safe_raster: bool = False,
+) -> str:
     declared = (content_type or "").split(";", 1)[0].strip().lower()
     sniffed = _veo_sniff_image_mime(head)
     if sniffed:
         return sniffed
+    if require_safe_raster:
+        sample = bytes(head or b"")[:32].hex()
+        raise NonPenalizedTaskError(
+            "public API image must be a recognized raster image "
+            f"(JPEG, PNG, GIF, WebP, BMP, TIFF, or AVIF); content_type={declared or 'unknown'}; "
+            f"first_bytes={sample}; source={safe_trim(source_label, 300)}",
+            status_code=400,
+            content_violation=True,
+        )
     bad_declared = declared.startswith("text/") or declared in {
         "application/json",
         "application/xml",
@@ -625,6 +669,11 @@ def _veo_cached_image_for_key(cache_key: str) -> Optional[Path]:
     return None
 
 
+def _veo_read_file_head(path: Path, limit: int = 4096) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(limit)
+
+
 def _veo_cleanup_local_image_cache_sync() -> None:
     try:
         cache_dir = _VEO_LOCAL_IMAGE_CACHE_DIR
@@ -673,15 +722,18 @@ async def _veo_maybe_cleanup_local_image_cache() -> None:
 
 
 async def _veo_local_image_lock(cache_key: str) -> asyncio.Lock:
-    async with _VEO_LOCAL_IMAGE_LOCKS_GUARD:
-        lock = _VEO_LOCAL_IMAGE_LOCKS.get(cache_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _VEO_LOCAL_IMAGE_LOCKS[cache_key] = lock
-        return lock
+    digest = hashlib.sha256(str(cache_key).encode("utf-8", "ignore")).digest()
+    index = int.from_bytes(digest[:8], "big") % _VEO_LOCAL_IMAGE_LOCK_STRIPE_COUNT
+    return _VEO_LOCAL_IMAGE_LOCK_STRIPES[index]
 
 
-async def _veo_write_bytes_to_local_image_cache(data: bytes, *, content_type: str, source_label: str) -> Path:
+async def _veo_write_bytes_to_local_image_cache(
+    data: bytes,
+    *,
+    content_type: str,
+    source_label: str,
+    require_safe_raster: bool = False,
+) -> Path:
     max_bytes = _veo_local_image_max_bytes()
     if len(data) > max_bytes:
         raise NonPenalizedTaskError(
@@ -689,14 +741,20 @@ async def _veo_write_bytes_to_local_image_cache(data: bytes, *, content_type: st
             status_code=413,
             content_violation=True,
         )
+    effective_type = _veo_validate_image_bytes(
+        data[:4096],
+        content_type=content_type,
+        source_label=source_label,
+        require_safe_raster=require_safe_raster,
+    )
     cache_key = hashlib.sha256(data).hexdigest()
     lock = await _veo_local_image_lock(f"bytes:{cache_key}")
     async with lock:
         cached = _veo_cached_image_for_key(cache_key)
         if cached:
+            await asyncio.to_thread(cached.touch)
             return cached
         _VEO_LOCAL_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        effective_type = _veo_validate_image_bytes(data[:4096], content_type=content_type, source_label=source_label)
         ext = _veo_image_ext_from_mime_or_url(effective_type, source_label)
         final = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}{ext}"
         tmp = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}.{uuid.uuid4().hex}.tmp"
@@ -712,12 +770,64 @@ async def _veo_write_bytes_to_local_image_cache(data: bytes, *, content_type: st
         return final
 
 
-async def _veo_download_url_to_local_image_cache(source_url: str) -> Path:
+async def cache_public_api_image_bytes(
+    data: bytes,
+    *,
+    content_type: str,
+    source_label: str,
+) -> str:
+    """Validate and cache an uploaded public-API image, returning its asset URL.
+
+    Public routes use this wrapper so uploads share the same MIME sniffing,
+    per-file size limit, TTL cleanup, aggregate cache limit, and URL generation
+    as browser workflow inputs.
+    """
+
+    if not data:
+        raise NonPenalizedTaskError(
+            f"uploaded image is empty: {safe_trim(source_label, 300)}",
+            status_code=400,
+            content_violation=True,
+        )
+    await _veo_maybe_cleanup_local_image_cache()
+    local_path = await _veo_write_bytes_to_local_image_cache(
+        data,
+        content_type=content_type,
+        source_label=source_label,
+        require_safe_raster=True,
+    )
+    await asyncio.to_thread(_veo_cleanup_local_image_cache_sync)
+    if not local_path.exists():
+        raise NonPenalizedTaskError(
+            "uploaded image could not be retained within the configured cache capacity",
+            status_code=507,
+        )
+    return _veo_local_asset_url(local_path)
+
+
+def public_api_image_max_bytes() -> int:
+    return _veo_local_image_max_bytes()
+
+
+async def _veo_download_url_to_local_image_cache(
+    source_url: str,
+    *,
+    require_safe_raster: bool = False,
+) -> Path:
     cache_key = hashlib.sha256(source_url.encode("utf-8", "ignore")).hexdigest()
     lock = await _veo_local_image_lock(f"url:{cache_key}")
     async with lock:
         cached = _veo_cached_image_for_key(cache_key)
         if cached:
+            if require_safe_raster:
+                head = await asyncio.to_thread(_veo_read_file_head, cached)
+                _veo_validate_image_bytes(
+                    head,
+                    content_type=mimetypes.guess_type(cached.name)[0] or "",
+                    source_label=source_url,
+                    require_safe_raster=True,
+                )
+            await asyncio.to_thread(cached.touch)
             return cached
         _VEO_LOCAL_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         max_bytes = _veo_local_image_max_bytes()
@@ -786,7 +896,12 @@ async def _veo_download_url_to_local_image_cache(source_url: str) -> Path:
                     status_code=502,
                     content_violation=True,
                 )
-            effective_type = _veo_validate_image_bytes(bytes(head), content_type=content_type, source_label=source_url)
+            effective_type = _veo_validate_image_bytes(
+                bytes(head),
+                content_type=content_type,
+                source_label=source_url,
+                require_safe_raster=require_safe_raster,
+            )
             ext = _veo_image_ext_from_mime_or_url(effective_type, final_url)
             final = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}{ext}"
             assert final is not None
@@ -939,12 +1054,26 @@ async def _veo_materialize_image_for_extension(
     kind: str,
     index: int,
     total: int,
+    require_safe_raster: bool,
     progress_cb: ProgressCB,
     log_file: Optional[Path],
 ) -> str:
     raw = str(source_url or "").strip()
-    if not raw or _veo_is_local_asset_url(raw):
+    if not raw:
         return raw
+    if _veo_is_local_asset_url(raw):
+        if not require_safe_raster:
+            return raw
+        local_path = _veo_trusted_local_asset_path(raw)
+        if local_path is not None:
+            head = await asyncio.to_thread(_veo_read_file_head, local_path)
+            _veo_validate_image_bytes(
+                head,
+                content_type=mimetypes.guess_type(local_path.name)[0] or "",
+                source_label=raw,
+                require_safe_raster=True,
+            )
+            return raw
     parsed = urlparse(raw)
     if parsed.scheme.lower() not in {"http", "https", "data"}:
         raise NonPenalizedTaskError(
@@ -982,10 +1111,18 @@ async def _veo_materialize_image_for_extension(
                 status_code=400,
                 content_violation=True,
             )
-        local_path = await _veo_write_bytes_to_local_image_cache(data, content_type=mime, source_label=f"data:{mime}")
+        local_path = await _veo_write_bytes_to_local_image_cache(
+            data,
+            content_type=mime,
+            source_label=f"data:{mime}",
+            require_safe_raster=require_safe_raster,
+        )
     else:
         try:
-            local_path = await _veo_download_url_to_local_image_cache(raw)
+            local_path = await _veo_download_url_to_local_image_cache(
+                raw,
+                require_safe_raster=require_safe_raster,
+            )
         except NonPenalizedTaskError as first_err:
             last_err = first_err
             for alt in _veo_local_download_fallback_urls(raw):
@@ -995,7 +1132,10 @@ async def _veo_materialize_image_for_extension(
                     f"source={safe_trim(raw, 220)!r} alt={safe_trim(alt, 220)!r} err={safe_trim(str(last_err), 220)!r}",
                 )
                 try:
-                    local_path = await _veo_download_url_to_local_image_cache(alt)
+                    local_path = await _veo_download_url_to_local_image_cache(
+                        alt,
+                        require_safe_raster=require_safe_raster,
+                    )
                     break
                 except NonPenalizedTaskError as e:
                     last_err = e
@@ -1042,6 +1182,7 @@ async def _veo_materialize_image_urls_for_extension(
             kind=kind,
             index=i,
             total=len(srcs),
+            require_safe_raster=bool(payload.get("public_api_safe_raster_only")),
             progress_cb=progress_cb,
             log_file=log_file,
         )

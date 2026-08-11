@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Body
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, Field, ValidationError
+from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..core.auth import verify_api_key_header
 from ..core.database import Database
@@ -25,6 +32,8 @@ from ..core.public_api_limits import (
 )
 from ..services.task_service import TaskService
 from ..services.task_handler_registry import CreateTaskContext, get_create_task_handler
+from ..services.task_executor_types import NonPenalizedTaskError
+from ..services.veo_workflow_executor import cache_public_api_image_bytes, public_api_image_max_bytes
 
 
 router = APIRouter()
@@ -54,6 +63,10 @@ _system_config_cache: tuple[float, Optional[bool], Optional[int], Optional[int]]
 _task_type_cache: dict[str, tuple[float, Any]] = {}
 _IMAGE_GENERATION_SYNC_TIMEOUT_SEC = max(1.0, float(os.getenv("IMAGE_GENERATION_SYNC_TIMEOUT_SEC", "600")))
 _IMAGE_GENERATION_SYNC_POLL_INTERVAL_SEC = max(0.2, float(os.getenv("IMAGE_GENERATION_SYNC_POLL_INTERVAL_SEC", "2.0")))
+_VIDEO_CONTENT_INLINE_MAX_BYTES = max(
+    1,
+    int(os.getenv("VIDEO_CONTENT_INLINE_MAX_BYTES", str(100 * 1024 * 1024))),
+)
 
 
 def set_dependencies(database: Database) -> None:
@@ -109,6 +122,65 @@ class CreateImageGenerationRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class CreateImageEditJSONRequest(CreateImageGenerationRequest):
+    n: Optional[int] = Field(default=1, ge=1, le=1)
+    image: Optional[Any] = Field(
+        default=None,
+        json_schema_extra={
+            "anyOf": [
+                {"type": "string"},
+                {"type": "object"},
+                {"type": "array", "minItems": 1, "maxItems": 7},
+            ]
+        },
+    )
+    images: Optional[List[Any]] = Field(default=None, min_length=1, max_length=7)
+    model_config = {
+        "extra": "allow",
+        "json_schema_extra": {
+            "anyOf": [
+                {"required": ["image"]},
+                {"required": ["images"]},
+            ]
+        },
+    }
+
+
+class OpenAIImageDataItem(BaseModel):
+    url: Optional[str] = None
+    b64_json: Optional[str] = None
+    revised_prompt: Optional[str] = None
+
+
+class OpenAIImageResponse(BaseModel):
+    created: int
+    data: List[OpenAIImageDataItem]
+
+
+class OpenAIErrorDetail(BaseModel):
+    message: str
+    type: str
+    param: Optional[str] = None
+    code: str
+
+
+class OpenAIErrorResponse(BaseModel):
+    error: OpenAIErrorDetail
+
+
+class NewAPIVideoResponse(BaseModel):
+    id: str
+    task_id: str
+    object: str = "video"
+    created_at: int
+    status: str
+    progress: int
+    model: str
+    video_url: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    model_config = {"extra": "allow"}
+
+
 OPENAI_COMPAT_VIDEO_MODELS = (
     "seedance-2",
     "seedance-2-fast",
@@ -148,6 +220,24 @@ GPT_IMAGE2_VIDEO_MODELS: Dict[str, str] = {
     "gpt-image2-2k": "2k",
     "gpt-image2-4k": "4k",
 }
+NANA_BANANA_IMAGE_MODELS = {
+    "nana-banana-2",
+    "nana-banana-pro",
+    "nana-banana-2-4k",
+    "nana-banana-pro-4k",
+}
+_IMAGE_EDIT_MAX_REFERENCE_IMAGES = 7
+_IMAGE_EDIT_MAX_MULTIPART_FILES = _IMAGE_EDIT_MAX_REFERENCE_IMAGES + 1
+_IMAGE_EDIT_MAX_FORM_FIELDS = 20
+_IMAGE_EDIT_MAX_FORM_FIELD_BYTES = 64 * 1024
+_INLINE_VIDEO_MIME_TYPES = {
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+    "video/x-matroska",
+    "video/ogg",
+    "video/x-msvideo",
+}
 
 
 def _public_image_model_from_sync_model(model: str) -> Optional[str]:
@@ -156,6 +246,269 @@ def _public_image_model_from_sync_model(model: str) -> Optional[str]:
         return None
     base = raw[: -len("_sync")]
     return base if base in OPENAI_COMPAT_IMAGE_MODEL_SET else None
+
+
+def _validate_image_request_model(raw: Dict[str, Any]) -> CreateImageGenerationRequest:
+    try:
+        return CreateImageGenerationRequest.model_validate(raw)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors(), body=raw) from exc
+
+
+def _normalize_public_image_reference(value: Any, *, param: str) -> str:
+    raw: Any = value
+    if isinstance(raw, dict):
+        nested = raw.get("image_url")
+        if isinstance(nested, dict):
+            nested = nested.get("url")
+        raw = raw.get("url") or nested or raw.get("imageUrl") or raw.get("src")
+    if not isinstance(raw, str) or not raw.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"message": f"{param} must be an HTTP(S) URL or data:image base64 URL", "param": param},
+        )
+    reference = raw.strip()
+    parsed = urlparse(reference)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        return reference
+    if re.match(r"^data:image/[A-Za-z0-9.+-]+;base64,", reference, flags=re.I):
+        return reference
+    raise HTTPException(
+        status_code=400,
+        detail={"message": f"{param} must be an HTTP(S) URL or data:image base64 URL", "param": param},
+    )
+
+
+_MULTIPART_SIZE_ERROR_PREFIX = "public image upload size limit exceeded:"
+
+
+class _PublicImageMultipartParser(MultiPartParser):
+    def __init__(self, *args, max_file_bytes: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_file_bytes = max_file_bytes
+        self._current_file_bytes = 0
+
+    def on_part_begin(self) -> None:
+        self._current_file_bytes = 0
+        super().on_part_begin()
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._current_part.file is not None:
+            self._current_file_bytes += end - start
+            if self._current_file_bytes > self._max_file_bytes:
+                raise MultiPartException(
+                    f"{_MULTIPART_SIZE_ERROR_PREFIX} file exceeds {self._max_file_bytes} bytes"
+                )
+        super().on_part_data(data, start, end)
+
+
+async def _parse_public_image_multipart(request: Request):
+    max_file_bytes = public_api_image_max_bytes()
+    max_request_bytes = (
+        max_file_bytes * _IMAGE_EDIT_MAX_MULTIPART_FILES
+        + _IMAGE_EDIT_MAX_FORM_FIELD_BYTES * _IMAGE_EDIT_MAX_FORM_FIELDS
+        + 1024 * 1024
+    )
+    content_length = str(request.headers.get("content-length") or "").strip()
+    if content_length.isdigit() and int(content_length) > max_request_bytes:
+        raise HTTPException(status_code=413, detail="multipart request exceeds the upload size limit")
+
+    async def limited_stream():
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > max_request_bytes:
+                raise MultiPartException(
+                    f"{_MULTIPART_SIZE_ERROR_PREFIX} request exceeds {max_request_bytes} bytes"
+                )
+            yield chunk
+
+    parser = _PublicImageMultipartParser(
+        request.headers,
+        limited_stream(),
+        max_files=_IMAGE_EDIT_MAX_MULTIPART_FILES,
+        max_fields=_IMAGE_EDIT_MAX_FORM_FIELDS,
+        max_part_size=_IMAGE_EDIT_MAX_FORM_FIELD_BYTES,
+        max_file_bytes=max_file_bytes,
+    )
+    try:
+        return await parser.parse()
+    except MultiPartException as exc:
+        message = str(exc)
+        status_code = 413 if message.startswith(_MULTIPART_SIZE_ERROR_PREFIX) else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+
+async def _read_limited_json_body(request: Request) -> Any:
+    max_file_bytes = public_api_image_max_bytes()
+    max_json_bytes = ((max_file_bytes * _IMAGE_EDIT_MAX_MULTIPART_FILES + 2) // 3) * 4 + 1024 * 1024
+    content_length = str(request.headers.get("content-length") or "").strip()
+    if content_length.isdigit() and int(content_length) > max_json_bytes:
+        raise HTTPException(status_code=413, detail="JSON request exceeds the image input size limit")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > max_json_bytes:
+            raise HTTPException(status_code=413, detail="JSON request exceeds the image input size limit")
+    try:
+        return json.loads(bytes(body))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="request body is not valid JSON") from exc
+
+
+async def _cache_public_image_upload(upload: StarletteUploadFile, *, param: str) -> str:
+    filename = str(upload.filename or param).strip() or param
+    max_bytes = public_api_image_max_bytes()
+    try:
+        if isinstance(upload.size, int) and upload.size > max_bytes:
+            raise NonPenalizedTaskError(
+                f"uploaded image exceeds limit={max_bytes} bytes: {filename}",
+                status_code=413,
+                content_violation=True,
+            )
+        data = bytearray()
+        while True:
+            chunk = await upload.read(min(1024 * 1024, max_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise NonPenalizedTaskError(
+                    f"uploaded image exceeds limit={max_bytes} bytes: {filename}",
+                    status_code=413,
+                    content_violation=True,
+                )
+        return await cache_public_api_image_bytes(
+            bytes(data),
+            content_type=str(upload.content_type or "application/octet-stream"),
+            source_label=filename,
+        )
+    except NonPenalizedTaskError as exc:
+        raise HTTPException(
+            status_code=int(exc.status_code or 400),
+            detail={"message": str(exc), "param": param, "code": "invalid_image"},
+        ) from exc
+    finally:
+        await upload.close()
+
+
+async def _build_image_edit_payload(
+    body: CreateImageGenerationRequest,
+    reference_values: List[Any],
+    mask_value: Any,
+) -> Dict[str, Any]:
+    if not 1 <= len(reference_values) <= _IMAGE_EDIT_MAX_REFERENCE_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"image edits require between 1 and {_IMAGE_EDIT_MAX_REFERENCE_IMAGES} reference images",
+        )
+
+    public_model = _public_image_model_from_sync_model(body.model)
+    if not public_model:
+        raise HTTPException(
+            status_code=400,
+            detail=f"model {body.model or '<empty>'} is not supported by image edit endpoint; use *_sync image models",
+        )
+    if body.n not in (None, 1):
+        raise HTTPException(status_code=400, detail="/v1/images/edits currently supports n=1")
+    if public_model in NANA_BANANA_IMAGE_MODELS and mask_value is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "mask is not supported by nana-banana models; submit reference images without a mask",
+                "param": "mask",
+                "code": "mask_not_supported",
+            },
+        )
+
+    references: List[str] = []
+    for index, value in enumerate(reference_values):
+        if isinstance(value, StarletteUploadFile):
+            reference = await _cache_public_image_upload(value, param=f"image[{index}]")
+        else:
+            reference = _normalize_public_image_reference(value, param=f"image[{index}]")
+        references.append(reference)
+
+    mask: Optional[str] = None
+    if mask_value is not None:
+        if isinstance(mask_value, StarletteUploadFile):
+            mask = await _cache_public_image_upload(mask_value, param="mask")
+        else:
+            mask = _normalize_public_image_reference(mask_value, param="mask")
+
+    payload = body.model_dump(exclude_none=True)
+    payload.pop("image", None)
+    payload["images"] = references
+    payload["public_api_safe_raster_only"] = True
+    if mask:
+        payload["mask"] = mask
+    else:
+        payload.pop("mask", None)
+    return payload
+
+
+async def _parse_image_edit_payload(request: Request) -> Dict[str, Any]:
+    content_type = str(request.headers.get("content-type") or "").lower()
+    if content_type.startswith("application/json") or "+json" in content_type:
+        raw = await _read_limited_json_body(request)
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        body = _validate_image_request_model(raw)
+        reference_values: List[Any] = []
+        for value in (body.image, body.images):
+            if isinstance(value, list):
+                reference_values.extend(value)
+            elif value is not None:
+                reference_values.append(value)
+        return await _build_image_edit_payload(body, reference_values, body.mask)
+
+    if content_type.startswith("multipart/form-data"):
+        form = await _parse_public_image_multipart(request)
+        try:
+            for field_name, value in form.multi_items():
+                if isinstance(value, StarletteUploadFile) and field_name not in {"image", "mask"}:
+                    raise HTTPException(status_code=400, detail=f"unexpected file field: {field_name}")
+
+            reference_values = list(form.getlist("image"))
+            if any(not isinstance(value, StarletteUploadFile) for value in reference_values):
+                raise HTTPException(status_code=400, detail="multipart image fields must be files")
+            mask_values = list(form.getlist("mask"))
+            if len(mask_values) > 1:
+                raise HTTPException(status_code=400, detail="only one mask file is supported")
+            mask_value = mask_values[0] if mask_values else None
+            if mask_value is not None and not isinstance(mask_value, StarletteUploadFile):
+                raise HTTPException(status_code=400, detail="multipart mask field must be a file")
+
+            raw = {}
+            for field_name in (
+                "model",
+                "prompt",
+                "n",
+                "size",
+                "quality",
+                "response_format",
+                "user",
+                "background",
+                "output_format",
+                "output_compression",
+                "negative_prompt",
+                "seed",
+                "aspect_ratio",
+            ):
+                value = form.get(field_name)
+                if value is not None:
+                    if isinstance(value, StarletteUploadFile):
+                        raise HTTPException(status_code=400, detail=f"{field_name} must be a form field")
+                    raw[field_name] = value
+            body = _validate_image_request_model(raw)
+            return await _build_image_edit_payload(body, reference_values, mask_value)
+        finally:
+            await form.close()
+
+    raise HTTPException(
+        status_code=415,
+        detail="content type must be application/json or multipart/form-data",
+    )
 
 
 def _require_video_image_seconds_4(payload: Dict[str, Any], model: str) -> None:
@@ -556,6 +909,28 @@ def _build_openai_image_generation_response(task: Any, payload: Dict[str, Any]) 
     }
 
 
+async def _run_sync_image_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    task_type_code, normalized = _normalize_image_generation_task_payload(payload)
+    created = await _create_task_from_request(
+        CreateTaskRequest(
+            task_type_code=task_type_code,
+            json=normalized,
+        )
+    )
+    task_id = str(created.get("task_id") or "").strip()
+    if not task_id:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "task creation response did not include task_id", "code": "invalid_task_response"},
+        )
+    task = await _wait_for_task_final(
+        task_id,
+        timeout_sec=_IMAGE_GENERATION_SYNC_TIMEOUT_SEC,
+        poll_interval_sec=_IMAGE_GENERATION_SYNC_POLL_INTERVAL_SEC,
+    )
+    return _build_openai_image_generation_response(task, normalized)
+
+
 async def _wait_for_task_final(task_id: str, timeout_sec: float, poll_interval_sec: float) -> Any:
     if not db:
         raise HTTPException(status_code=500, detail="db not initialized")
@@ -657,6 +1032,105 @@ async def _get_newapi_video_status_response(task_id: str) -> JSONResponse:
         }
 
     return JSONResponse(content=resp)
+
+
+async def _get_video_content_response(task_id: str) -> Response:
+    if not db:
+        raise HTTPException(status_code=500, detail="db not initialized")
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise HTTPException(status_code=400, detail="task_id cannot be empty")
+
+    task = await db.get_task(tid)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    status = _normalize_newapi_task_status(getattr(task, "status", None))
+    if status != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"video content is unavailable while task status is {status or 'unknown'}",
+                "code": "video_not_completed",
+            },
+        )
+
+    result = task.result if isinstance(task.result, dict) else {}
+    payload = _parse_task_prompt_payload(getattr(task, "prompt", None))
+    workflow_kind = str(result.get("workflow_kind") or payload.get("workflow_kind") or "").strip().lower()
+    model = str(payload.get("model") or result.get("model") or "").strip()
+    if ("image" in workflow_kind and "video" not in workflow_kind) or model in OPENAI_COMPAT_IMAGE_MODEL_SET:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "completed task contains an image result, not video content", "code": "video_result_missing"},
+        )
+
+    video_url, _image_url, _result_urls = _extract_public_result_urls(result)
+    source = str(video_url or "").strip()
+    if not source:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "completed task does not contain a video result", "code": "video_result_missing"},
+        )
+
+    parsed = urlparse(source)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        return RedirectResponse(url=source, status_code=307)
+
+    match = re.fullmatch(
+        r"data:(video/[A-Za-z0-9.+-]+);base64,(.*)",
+        source,
+        flags=re.I | re.S,
+    )
+    if match:
+        media_type = match.group(1).lower()
+        if media_type not in _INLINE_VIDEO_MIME_TYPES:
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "video result uses an unsupported media type", "code": "invalid_video_result"},
+            )
+        raw_encoded = match.group(2)
+        max_encoded = ((_VIDEO_CONTENT_INLINE_MAX_BYTES + 2) // 3) * 4
+        if len(raw_encoded) > max_encoded + 4096:
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "inline video result exceeds the configured size limit", "code": "video_result_too_large"},
+            )
+        encoded = re.sub(r"\s+", "", raw_encoded)
+        if len(encoded) > max_encoded:
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "inline video result exceeds the configured size limit", "code": "video_result_too_large"},
+            )
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError, binascii.Error) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "video result contains invalid base64 data", "code": "invalid_video_result"},
+            ) from exc
+        if len(content) > _VIDEO_CONTENT_INLINE_MAX_BYTES:
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "inline video result exceeds the configured size limit", "code": "video_result_too_large"},
+            )
+        if not content:
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "video result contains empty base64 data", "code": "invalid_video_result"},
+            )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+        )
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "message": "video result URL must use HTTP(S) or data:video base64",
+            "code": "invalid_video_result",
+        },
+    )
 
 
 async def _get_public_runtime_limits_cached() -> tuple[bool, int, int]:
@@ -942,7 +1416,19 @@ async def create_chat_completion_for_newapi_test(
     )
 
 
-@router.post("/v1/videos")
+@router.post(
+    "/v1/videos",
+    response_model=NewAPIVideoResponse,
+    response_model_exclude_unset=True,
+    responses={
+        400: {"model": OpenAIErrorResponse},
+        401: {"model": OpenAIErrorResponse},
+        403: {"model": OpenAIErrorResponse},
+        422: {"model": OpenAIErrorResponse},
+        429: {"model": OpenAIErrorResponse},
+        500: {"model": OpenAIErrorResponse},
+    },
+)
 async def create_video(
     api_key: str = Depends(verify_api_key_header),
     body: CreateVideoRequest = Body(...),
@@ -956,31 +1442,88 @@ async def create_video(
     )
     task_id = str(created.get("task_id") or "").strip()
     if not task_id:
-        return created
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "task creation response did not include task_id", "code": "invalid_task_response"},
+        )
     return _build_newapi_video_create_response(task_id, payload)
 
 
-@router.post("/v1/images/generations")
+@router.post(
+    "/v1/images/generations",
+    response_model=OpenAIImageResponse,
+    response_model_exclude_none=True,
+    responses={
+        400: {"model": OpenAIErrorResponse},
+        401: {"model": OpenAIErrorResponse},
+        403: {"model": OpenAIErrorResponse},
+        422: {"model": OpenAIErrorResponse},
+        429: {"model": OpenAIErrorResponse},
+        500: {"model": OpenAIErrorResponse},
+        502: {"model": OpenAIErrorResponse},
+        504: {"model": OpenAIErrorResponse},
+    },
+)
 async def create_image_generation(
     api_key: str = Depends(verify_api_key_header),
     body: CreateImageGenerationRequest = Body(...),
 ):
-    task_type_code, payload = _normalize_image_generation_task_payload(body.model_dump(exclude_none=True))
-    created = await _create_task_from_request(
-        CreateTaskRequest(
-            task_type_code=task_type_code,
-            json=payload,
-        )
-    )
-    task_id = str(created.get("task_id") or "").strip()
-    if not task_id:
-        return created
-    task = await _wait_for_task_final(
-        task_id,
-        timeout_sec=_IMAGE_GENERATION_SYNC_TIMEOUT_SEC,
-        poll_interval_sec=_IMAGE_GENERATION_SYNC_POLL_INTERVAL_SEC,
-    )
-    return _build_openai_image_generation_response(task, payload)
+    return await _run_sync_image_task(body.model_dump(exclude_none=True))
+
+
+@router.post(
+    "/v1/images/edits",
+    response_model=OpenAIImageResponse,
+    response_model_exclude_none=True,
+    responses={
+        400: {"model": OpenAIErrorResponse},
+        401: {"model": OpenAIErrorResponse},
+        403: {"model": OpenAIErrorResponse},
+        413: {"model": OpenAIErrorResponse},
+        415: {"model": OpenAIErrorResponse},
+        422: {"model": OpenAIErrorResponse},
+        429: {"model": OpenAIErrorResponse},
+        500: {"model": OpenAIErrorResponse},
+        502: {"model": OpenAIErrorResponse},
+        504: {"model": OpenAIErrorResponse},
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {"schema": CreateImageEditJSONRequest.model_json_schema()},
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model", "prompt", "image"],
+                        "properties": {
+                            "model": {"type": "string", "example": "gpt-image2-1k_sync"},
+                            "prompt": {"type": "string"},
+                            "image": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": _IMAGE_EDIT_MAX_REFERENCE_IMAGES,
+                                "items": {"type": "string", "format": "binary"},
+                            },
+                            "mask": {"type": "string", "format": "binary"},
+                            "n": {"type": "integer", "enum": [1], "default": 1},
+                            "size": {"type": "string"},
+                            "quality": {"type": "string"},
+                            "response_format": {"type": "string", "enum": ["url", "b64_json"]},
+                            "user": {"type": "string"},
+                        },
+                    }
+                },
+            },
+        }
+    },
+)
+async def create_image_edit(
+    request: Request,
+    api_key: str = Depends(verify_api_key_header),
+):
+    payload = await _parse_image_edit_payload(request)
+    return await _run_sync_image_task(payload)
 
 
 @router.get("/v1/tasks/{task_id}")
@@ -988,6 +1531,35 @@ async def get_task_status(task_id: str, api_key: str = Depends(verify_api_key_he
     return await _get_task_status_response(task_id)
 
 
-@router.get("/v1/videos/{task_id}")
+@router.get(
+    "/v1/videos/{task_id}",
+    response_model=NewAPIVideoResponse,
+    response_model_exclude_unset=True,
+    responses={
+        400: {"model": OpenAIErrorResponse},
+        401: {"model": OpenAIErrorResponse},
+        403: {"model": OpenAIErrorResponse},
+        404: {"model": OpenAIErrorResponse},
+        500: {"model": OpenAIErrorResponse},
+    },
+)
 async def get_video_status(task_id: str, api_key: str = Depends(verify_api_key_header)):
     return await _get_newapi_video_status_response(task_id)
+
+
+@router.get(
+    "/v1/videos/{task_id}/content",
+    response_class=Response,
+    responses={
+        200: {"description": "Inline video bytes from a data:video result"},
+        307: {"description": "Redirect to the provider video URL"},
+        401: {"model": OpenAIErrorResponse},
+        403: {"model": OpenAIErrorResponse},
+        404: {"model": OpenAIErrorResponse},
+        409: {"model": OpenAIErrorResponse},
+        422: {"model": OpenAIErrorResponse},
+        502: {"model": OpenAIErrorResponse},
+    },
+)
+async def get_video_content(task_id: str, api_key: str = Depends(verify_api_key_header)):
+    return await _get_video_content_response(task_id)

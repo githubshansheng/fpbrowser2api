@@ -10,9 +10,12 @@ from pathlib import Path
 import re
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .api import admin, analyze, routes
 from .core.config import config
@@ -189,6 +192,90 @@ app = FastAPI(
 )
 
 
+def _openai_error_type(status_code: int) -> str:
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code >= 500:
+        return "server_error"
+    return "invalid_request_error"
+
+
+def _openai_error_response(
+    status_code: int,
+    detail,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    message = "request failed"
+    param = None
+    code = None
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or detail.get("detail") or message)
+        raw_param = detail.get("param")
+        param = str(raw_param) if raw_param is not None else None
+        raw_code = detail.get("code")
+        code = str(raw_code) if raw_code is not None else None
+    elif detail is not None:
+        message = str(detail).strip() or message
+
+    error_type = _openai_error_type(status_code)
+    if not code:
+        if status_code == 401:
+            code = "invalid_api_key"
+        elif status_code == 429:
+            code = "rate_limit_exceeded"
+        elif status_code >= 500:
+            code = "server_error"
+        else:
+            code = "invalid_request"
+
+    response_headers = dict(headers or {})
+    if status_code == 429 and not any(key.lower() == "retry-after" for key in response_headers):
+        response_headers["Retry-After"] = "1"
+    return JSONResponse(
+        status_code=status_code,
+        headers=response_headers or None,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def public_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if not request.url.path.startswith("/v1/"):
+        return await http_exception_handler(request, exc)
+    return _openai_error_response(
+        int(exc.status_code),
+        exc.detail,
+        headers=dict(exc.headers or {}),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def public_validation_exception_handler(request: Request, exc: RequestValidationError):
+    if not request.url.path.startswith("/v1/"):
+        return await request_validation_exception_handler(request, exc)
+    errors = exc.errors()
+    first = errors[0] if errors else {}
+    location = [str(item) for item in first.get("loc", ()) if str(item) not in {"body", "query", "path"}]
+    param = ".".join(location) or None
+    message = str(first.get("msg") or "request validation failed")
+    if param:
+        message = f"{param}: {message}"
+    return _openai_error_response(
+        422,
+        {"message": message, "param": param, "code": "validation_error"},
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -199,6 +286,17 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def public_api_unhandled_error(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        if not request.url.path.startswith("/v1/"):
+            raise
+        logger.exception("Unhandled public API error: %s %s", request.method, request.url.path)
+        return _openai_error_response(500, "internal server error")
+
+
+@app.middleware("http")
 async def request_logger(request: Request, call_next):
     """管理台写操作权限校验。
 
@@ -206,14 +304,14 @@ async def request_logger(request: Request, call_next):
     导致数据库体积快速增长；需要排查时可依赖 log_to_file / 应用日志。
     """
     # 与原先一致：JSON 请求预读 body 以便 Starlette 缓存，供下游路由重复读取
+    path = request.url.path
     content_type = (request.headers.get("content-type") or "").lower()
-    if "application/json" in content_type:
+    if "application/json" in content_type and path != "/v1/images/edits":
         try:
             await request.body()
         except Exception:
             pass
 
-    path = request.url.path
     method = (request.method or "").upper()
     if path.startswith("/api/admin") and method in {"POST", "PUT", "PATCH", "DELETE"}:
         bypass_paths = {

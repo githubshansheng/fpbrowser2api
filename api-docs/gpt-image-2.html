@@ -10,7 +10,7 @@
   <header>
     <a href="../index.html">返回接口目录</a>
     <h1>GPT Image 2 · 图片 API 接入文档</h1>
-    <p>本文档将异步接口 <code>/v1/videos</code> 与同步接口 <code>/v1/images/generations</code> 分开说明。</p>
+    <p>本文档分别说明异步接口 <code>/v1/videos</code>、同步生成接口 <code>/v1/images/generations</code> 和 OpenAI 兼容编辑接口 <code>/v1/images/edits</code>。</p>
   </header>
   <main>
     <article>
@@ -160,6 +160,16 @@
     }
   ]
 }</code></pre>
+
+      <h2>OpenAI 兼容编辑接口：/v1/images/edits</h2>
+      <p>该接口支持 JSON URL/data URL 和 multipart 文件上传。可重复提交 1–7 个 <code>image</code> 字段，并可额外提交一个 <code>mask</code>。模型使用 <code>*_sync</code> 名称，<code>n</code> 只能为 <code>1</code>。</p>
+<pre><code>curl -X POST https://xxx.xxx.xxx/v1/images/edits \
+  -H "Authorization: Bearer api-key" \
+  -F "model=gpt-image2-1k_sync" \
+  -F "prompt=只修改蒙版区域" \
+  -F "image=@source.png" \
+  -F "mask=@mask.png" \
+  -F "n=1"</code></pre>
     </article>
   </main>
 </body>
