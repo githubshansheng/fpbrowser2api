@@ -2,7 +2,7 @@
 
 本模块把“模型调用”和“Playwright 页面实时操作”封装成可复用能力：
 
-- 大模型中转站地址固定为 https://www.newtoken.club/；
+- 大模型中转站地址固定为 https://ai.heigh.vip/；
 - 根据模型自动选择 `/v1/responses` 或 `/v1/chat/completions`；
 - 对浏览器页面做轻量 DOM 扫描，给可交互元素分配临时 ref；
 - LLM 只返回结构化 JSON 动作，执行器再通过 Playwright 落地；
@@ -31,7 +31,7 @@ from ..core.paths import LOGS_DIR
 from .playwright_broswer_context import page_fetch_json, page_fetch_tx, safe_trim
 
 
-AI_AGENT_BASE_URL = "https://www.newtoken.club/"
+AI_AGENT_BASE_URL = "https://ai.heigh.vip/"
 AI_AGENT_MODELS: Tuple[str, ...] = (
     "gpt-5.5",
     "claude-opus-4-6",
