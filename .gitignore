@@ -50,3 +50,10 @@ __pycache__/
 /data/*.db
 /data/*.db-shm
 /data/*.db-wal
+
+# Local browser-extension signing key (never commit private keys)
+/browser_extension_ai_heigh.pem
+
+# Generated local packages; keep source and release artifacts separate
+/browser_extension_ai_heigh.crx
+/fpbrowser2api.zip
