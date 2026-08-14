@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_extName__",
+  "version": "2.1.7",
+  "version_name": "2.1.7 ai.heigh.vip no-newapi",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "tabs",
+    "cookies",
+    "storage",
+    "scripting",
+    "alarms",
+    "webRequest",
+    "debugger",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "ws://*/*",
+    "https://*/*",
+    "https://labs.google/*",
+    "https://*.google.com/*",
+    "https://*.googleapis.com/*",
+    "https://dreamina.capcut.com/*",
+    "https://*.capcut.com/*",
+    "https://*.capcutapi.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "FPBrowser2API",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "https://labs.google/*",
+        "https://dreamina.capcut.com/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content/fpb_config_content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "popup.html?panel=1"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3Qpd0ABEpSdW/92XH+AX9R84P38xkVPeX/QwgAzuLLYC0tpc+AK4pY38wrzUu4QHIES3bCWw7b1BC+vS2PKyxluYZLMQ97grIF+Ml5LgEbAl6v7C3oWz6TUsNSGZlBKoMzaX9bosEvQjH8Fo972QP1ycd+mY0A2aAJx3o/iJ2ZvHg6xVeuF+2e4yBFjeerbxjvigtIoBwtLo2DaAXvnGWGY9W1rPQWde5hIAhrGrEniK1M74HaEO8Wwm+9BaeB51X6pyvNRFIX5KCJUeN40nkKxwgqSIszb+2xodFxbkEz1Qb7VexZxnY1k9UBUEzL8rwI16OuDoN/djAlTvmPVFawIDAQAB"
+}
